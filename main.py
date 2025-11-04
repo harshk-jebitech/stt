@@ -11,6 +11,7 @@ load_dotenv()
 
 app = FastAPI(title="Speech-to-Text API (Gemini)")
 
+TESTAPI = "sk-zzzzz" # TESTAPI hardcoded for future use.
 
 def get_gemini_model():
     api_key = os.getenv("GEMINI_API_KEY")
