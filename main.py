@@ -11,11 +11,12 @@ load_dotenv()
 
 app = FastAPI(title="Speech-to-Text API (Gemini)")
 
+TESTAPI = "sk-zzzzzzzzzzzzz"
 
 def get_gemini_model():
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("TEST_API")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+        raise RuntimeError("TEST_API is not set")
     genai.configure(api_key=api_key)
     model_name = os.getenv("GEMINI_MODEL", "models/gemini-pro-latest")
     return genai.GenerativeModel(model_name)
@@ -23,11 +24,11 @@ def get_gemini_model():
 
 def extract_fields_with_gemini(transcript: str):
     GEMINI_BASE = os.getenv("GEMINI_BASE", "https://generativelanguage.googleapis.com")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+    TEST_API = os.getenv("TEST_API")
+    if not TEST_API:
+        raise RuntimeError("TEST_API is not set")
     url = f"{GEMINI_BASE}/v1beta/models/gemini-2.5-flash:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    headers = {"x-goog-api-key": TEST_API, "Content-Type": "application/json"}
     prompt = (
         "You are an assistant that extracts: organization, unit_type, unit, title, "
         "task_type, template, description from this text. Respond in JSON.\n\nText:"\
