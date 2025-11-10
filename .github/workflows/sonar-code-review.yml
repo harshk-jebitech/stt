@@ -50,28 +50,6 @@ jobs:
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
         # The action will run the scanner and should produce report-task.txt in the workspace.
 
-      - name: Sonar debug: show report-task.txt & query server issues
-        env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
-        run: |
-          set -e
-          echo "Workspace files (top-level):"
-          ls -la || true
-          if [ -f report-task.txt ]; then
-            echo "---- report-task.txt ----"
-            cat report-task.txt
-            echo "-------------------------"
-          else
-            echo "report-task.txt not found in workspace."
-          fi
-          echo "Querying Sonar for recent issues (first 50)..."
-          BASE="${SONAR_HOST_URL%/}"
-          curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&ps=50" | jq '.paging, .issues | {count: (. | length), issues: .[0:10]}' || true
-          echo "Querying quality gate (project_status)..."
-          curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" | jq . || true
-
       - name: Ensure jq is available (for polling JSON)
         run: |
           if ! command -v jq >/dev/null 2>&1; then
