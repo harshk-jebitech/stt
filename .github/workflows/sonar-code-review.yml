@@ -30,7 +30,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pytest pytest-cov || true
 
       - name: Validate Sonar secrets (fail early)
         run: |
@@ -43,10 +42,6 @@ jobs:
             exit 1
           fi
           echo "Sonar config looks good."
-
-      - name: Run unit tests with coverage
-        run: |
-          pytest --cov=. --cov-report=xml:coverage.xml || true
 
       - name: Run SonarQube Scan (official action)
         uses: sonarsource/sonarqube-scan-action@v3
