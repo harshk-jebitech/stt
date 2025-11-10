@@ -48,14 +48,6 @@ jobs:
         env:
           SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName=stt
-            -Dsonar.sources=.
-            -Dsonar.python.version=3.10
-            -Dsonar.verbose=true
-            -Dsonar.python.coverage.reportPaths=coverage.xml
 
       - name: Copy scanner output for later steps (safe)
         run: |
