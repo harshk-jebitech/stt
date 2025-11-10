@@ -30,7 +30,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov || true
 
       - name: Validate Sonar secrets (fail early)
         run: |
@@ -61,19 +61,25 @@ jobs:
             -Dsonar.python.version=3.10
             -Dsonar.verbose=true
             -Dsonar.python.coverage.reportPaths=coverage.xml
-        
-      - name: Copy scanner output for later steps
+
+      - name: Copy scanner output for later steps (safe)
         run: |
-          echo "Copying scanner output..."
+          echo "Copying scanner output (attempting safe copy)..."
+          # try to copy into a workspace-owned folder, avoid copying root-owned directories wholesale
+          TARGET="$GITHUB_WORKSPACE/.scannerwork_copy"
+          mkdir -p "$TARGET"
+          # prefer .scannerwork contents if present
           if [ -d .scannerwork ]; then
-            mkdir -p $GITHUB_WORKSPACE/.scannerwork_copy
-            cp -r .scannerwork/* $GITHUB_WORKSPACE/.scannerwork_copy/ || true
-          elif [ -d .sonar ]; then
-            mkdir -p $GITHUB_WORKSPACE/.scannerwork_copy
-            cp -r .sonar/* $GITHUB_WORKSPACE/.scannerwork_copy/ || true
-          else
-            echo "No scanner output directory found."
+            echo "Found .scannerwork in workspace — copying files (ignore errors)..."
+            # copy file-by-file to avoid creating root-owned parent directories
+            find .scannerwork -maxdepth 2 -type f -print0 | xargs -0 -I{} cp -v {} "$TARGET/" 2>/dev/null || true
           fi
+          if [ -d .sonar ]; then
+            echo "Found .sonar in workspace — copying files (ignore errors)..."
+            find .sonar -maxdepth 2 -type f -print0 | xargs -0 -I{} cp -v {} "$TARGET/" 2>/dev/null || true
+          fi
+          echo "Listing $TARGET:"
+          ls -la "$TARGET" || true
 
       - name: Sonar debug -- show report-task.txt & query server issues
         env:
@@ -84,13 +90,20 @@ jobs:
           set -e
           echo "Workspace files (top-level):"
           ls -la || true
-          REPORT_PATH=$(find . -type f -name 'report-task.txt' | head -n 1 || true)
+
+          # locate the report-task.txt in several likely places
+          REPORT_PATH=$(find . -maxdepth 4 -type f -name 'report-task.txt' -print -quit || true)
+          # prefer the copied scanner folder if present
+          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork_copy ]; then
+            REPORT_PATH=$(find .scannerwork_copy -type f -name 'report-task.txt' -print -quit || true)
+          fi
+
           if [ -n "$REPORT_PATH" ]; then
             echo "---- $REPORT_PATH ----"
-            cat "$REPORT_PATH"
+            cat "$REPORT_PATH" || true
             echo "--------------------------------------"
           else
-            echo "report-task.txt not found in workspace."
+            echo "report-task.txt not found in workspace (searched up to depth 4)."
           fi
           echo "Querying Sonar for recent issues (first 50)..."
           BASE="${SONAR_HOST_URL%/}"
@@ -99,52 +112,125 @@ jobs:
           echo "Querying quality gate (project_status)..."
           curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" | jq . || true
 
-      - name: Wait for Sonar analysis & check Quality Gate
+      - name: Ensure jq is available (for polling JSON)
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+      - name: Wait for Sonar analysis & check Quality Gate (robust)
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
         run: |
           set -euo pipefail
-          echo "🔎 Locating report-task.txt..."
-          REPORT_PATH=$(find . -type f -name 'report-task.txt' | head -n 1 || true)
+          echo "🔎 Locating report-task.txt (written by the scanner)..."
 
-          if [ -z "$REPORT_PATH" ]; then
-            echo "⚠️ report-task.txt not found. The scanner might have skipped writing it."
-            echo "Listing workspace:"
-            ls -R | head -n 50
-            exit 0
+          # Try several common locations for report-task.txt
+          REPORT_PATH=""
+          REPORT_PATH=$(find . -maxdepth 4 -type f -name 'report-task.txt' -print -quit || true)
+          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork_copy ]; then
+            REPORT_PATH=$(find .scannerwork_copy -type f -name 'report-task.txt' -print -quit || true)
+          fi
+          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork ]; then
+            REPORT_PATH=$(find .scannerwork -type f -name 'report-task.txt' -print -quit || true)
           fi
 
-          echo "✅ Found report-task.txt: $REPORT_PATH"
-          cat "$REPORT_PATH"
+          if [ -z "$REPORT_PATH" ]; then
+            echo "⚠️ report-task.txt not found in workspace. Will fall back to polling by projectKey."
+          else
+            echo "✅ Found report-task.txt: $REPORT_PATH"
+            cat "$REPORT_PATH" || true
+          fi
 
-          CE_URL=$(grep '^ceTaskUrl=' "$REPORT_PATH" | cut -d'=' -f2- || true)
-          ANALYSIS_ID=$(grep '^analysisId=' "$REPORT_PATH" | cut -d'=' -f2- || true)
+          ANALYSIS_ID=""
+          CE_URL=""
 
-          echo "⏳ Checking analysis status..."
-          if [ -n "$CE_URL" ]; then
-            for i in $(seq 1 30); do
-              TASK_STATUS=$(curl -s -u "${SONAR_TOKEN}:" "$CE_URL" | jq -r '.task.status // empty')
-              echo "Attempt $i - task.status=$TASK_STATUS"
-              if [ "$TASK_STATUS" = "SUCCESS" ]; then
-                echo "✅ SonarQube task completed."
+          if [ -n "$REPORT_PATH" ]; then
+            CE_URL=$(grep '^ceTaskUrl=' "$REPORT_PATH" | cut -d'=' -f2- || true)
+            ANALYSIS_ID=$(grep '^analysisId=' "$REPORT_PATH" | cut -d'=' -f2- || true)
+          fi
+
+          sonar_api() {
+            local path="$1"
+            curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL%/}${path}"
+          }
+
+          # If we have a CE URL, poll the compute engine task until SUCCESS or FAILED
+          if [ -n "${CE_URL}" ]; then
+            echo "Polling Compute Engine task at: ${CE_URL}"
+            for i in $(seq 1 60); do
+              TASK_JSON=$(curl -s -u "${SONAR_TOKEN}:" "${CE_URL}")
+              status=$(echo "$TASK_JSON" | jq -r '.task.status // empty')
+              echo "  attempt $i - task.status=${status}"
+              if [ "${status}" = "SUCCESS" ]; then
+                if [ -z "${ANALYSIS_ID}" ]; then
+                  ANALYSIS_ID=$(echo "$TASK_JSON" | jq -r '.task.analysisId // empty')
+                fi
                 break
-              elif [ "$TASK_STATUS" = "FAILED" ]; then
-                echo "⚠️ Sonar Compute Engine reported failure — check Sonar logs."
+              fi
+              if [ "${status}" = "FAILED" ]; then
+                echo "❌ CE task failed:"
+                echo "$TASK_JSON" | jq . || true
+                exit 1
+              fi
+              sleep 5
+            done
+          fi
+
+          # If analysisId still unknown, fallback: try project_status by projectKey and wait until not "PENDING"
+          if [ -z "${ANALYSIS_ID}" ]; then
+            echo "Polling project status by projectKey (${SONAR_PROJECT_KEY}) as fallback..."
+            for i in $(seq 1 60); do
+              QG_JSON=$(sonar_api "/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}")
+              status=$(echo "$QG_JSON" | jq -r '.projectStatus.status // empty')
+              echo "  attempt $i - projectStatus.status=${status:-(none)}"
+              if [ -n "$status" ] && [ "$status" != "PENDING" ]; then
+                ANALYSIS_ID=$(echo "$QG_JSON" | jq -r '.projectStatus.analysisId // empty')
                 break
               fi
               sleep 5
             done
           fi
 
-          echo "📊 Fetching latest Quality Gate status (for reference only)..."
-          BASE="${SONAR_HOST_URL%/}"
-          QG_JSON=$(curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" || true)
-          echo "$QG_JSON" | jq . || true
-          STATUS=$(echo "$QG_JSON" | jq -r '.projectStatus.status // "UNKNOWN"')
-          echo "Quality Gate status: $STATUS"
-          echo "✅ Workflow continues regardless of gate result."
+          # If we still don't have analysisId, print latest project status and fail (or optionally continue)
+          if [ -z "${ANALYSIS_ID}" ]; then
+            echo "⚠️  Could not determine analysisId. Fetching current project quality gate status as last resort..."
+            QG_JSON=$(sonar_api "/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}")
+            echo "$QG_JSON" | jq . || true
+            status=$(echo "$QG_JSON" | jq -r '.projectStatus.status // "UNKNOWN"')
+            echo "Quality Gate status (fallback): $status"
+            if [ "$status" = "OK" ]; then
+              echo "✅ Quality Gate passed (fallback)."
+              exit 0
+            else
+              echo "❌ Quality Gate indicates failure or unknown (fallback). Failing job."
+              # show failed conditions if present
+              echo "$QG_JSON" | jq -r '.projectStatus.conditions[] | " - " + (.metricKey // "unknown") + ": " + (.status // "UNKNOWN") + " (actual: " + (.actual.value|tostring) + ")"' || true
+              exit 1
+            fi
+          fi
+
+          echo "Using analysisId: ${ANALYSIS_ID}"
+          # Now query quality gate by analysisId
+          QG_JSON=$(sonar_api "/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}")
+          echo "Quality Gate response:"
+          echo "$QG_JSON" | jq .
+
+          QG_STATUS=$(echo "$QG_JSON" | jq -r '.projectStatus.status // "UNKNOWN"')
+          echo "Final Quality Gate status: ${QG_STATUS}"
+
+          if [ "${QG_STATUS}" = "OK" ]; then
+            echo "✅ Quality Gate passed."
+            exit 0
+          else
+            echo "❌ Quality Gate failed (status=${QG_STATUS}). See Sonar UI for details."
+            echo "Failed conditions:"
+            echo "$QG_JSON" | jq -r '.projectStatus.conditions[] | " - " + (.metricKey // "unknown") + ": " + (.status // "UNKNOWN") + " (actual: " + (.actual.value|tostring) + ")"' || true
+            exit 1
+          fi
 
   gemini-review:
     name: Gemini AI Code Review
