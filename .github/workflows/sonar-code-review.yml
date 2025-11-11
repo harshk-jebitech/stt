@@ -401,7 +401,7 @@ jobs:
           echo "=== gemini_output.txt preview ==="
           sed -n '1,200p' gemini_output.txt || true
 
-      - name: Post Gemini Review — Part 1/2
+      - name: Post Gemini Review — Part 1/3
         if: always()
         uses: actions/github-script@v7
         with:
@@ -409,65 +409,68 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // read raw gemini output
+            // load raw output
             let raw = "No Gemini review output generated.";
             try {
               if (fs.existsSync('gemini_output.txt')) {
-                raw = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
+                raw = fs.readFileSync('gemini_output.txt', 'utf8') || raw;
               } else {
                 raw = "Gemini output file not found (gemini_output.txt).";
               }
             } catch (e) {
               raw = "Failed to read gemini_output.txt: " + e.toString();
             }
+            raw = raw.replace(/\r\n/g,'\n');
 
-            // small sanitization/cleanup (keeps markdown tables/headings intact)
-            let s = raw.replace(/\r\n/g, '\n');
-
-            // If whole output is fenced, unwrap the outermost pair
-            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
-              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
+            // find Static Code Review section
+            const marker = '### 3. Static Code Review';
+            let part = '';
+            if (raw.includes(marker)) {
+              const start = raw.indexOf(marker);
+              const after = raw.slice(start);
+              // end at next "### " heading if present
+              const next = after.indexOf('\n### ');
+              part = next === -1 ? after : after.slice(0, next);
             }
 
-            // Remove wrapper-like tags (summary/details/etc) but keep inner content
-            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
-
-            // Remove any stray self-closing single tags (not critical content)
-            s = s.replace(/<[^>]+\/>/g, '');
-
-            // Detect small uniform indent and remove (so markdown renders)
-            const lines = s.split('\n');
-            let minIndent = Infinity;
-            for (const l of lines) {
-              if (l.trim() === '') continue;
-              const m = l.match(/^(\s*)/);
-              if (m) minIndent = Math.min(minIndent, m[1].length);
+            // if section found, extract table header + first 3 rows
+            let body = '### 🤖 Gemini Code Review — Part 1/3\n\n';
+            if (part) {
+              const lines = part.split('\n');
+              // find table header line index (starts with "| #")
+              let headerIdx = lines.findIndex(l => l.trim().startsWith('| #') || l.trim().startsWith('| # |'));
+              if (headerIdx === -1) {
+                // fallback: include up to first 40 non-empty lines of the section
+                body += lines.filter(Boolean).slice(0, 40).join('\n');
+              } else {
+                const header = lines[headerIdx];
+                const sep = lines[headerIdx+1] || '';
+                body += header + '\n' + sep + '\n';
+                // capture first 3 data rows (lines after separator that start with '|')
+                let rows = [];
+                for (let i = headerIdx + 2; i < lines.length && rows.length < 3; i++) {
+                  const l = lines[i];
+                  if (!l || !l.trim().startsWith('|')) break;
+                  rows.push(l);
+                }
+                if (rows.length === 0) {
+                  // fallback to the section text if table rows not found
+                  body += lines.slice(headerIdx+2, headerIdx+8).join('\n');
+                } else {
+                  body += rows.join('\n') + '\n';
+                }
+              }
+              // add a continuation hint
+              body += '\n---\n*Continued in Part 2/3 (Sonar) and Part 3/3 (Encryption & Summary).*';
+            } else {
+              // fallback: post first 120 lines of raw
+              body += raw.split('\n').slice(0, 120).join('\n');
+              body += '\n\n_(Static Code Review section not found in Gemini output.)_';
             }
-            if (minIndent === Infinity) minIndent = 0;
-            if (minIndent > 0 && minIndent <= 8) {
-              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
-            }
 
-            // Collapse many blank lines
-            s = s.replace(/\n{3,}/g, '\n\n').trim();
-
-            // Split into two halves by line count
-            const allLines = s.split('\n');
-            const mid = Math.ceil(allLines.length / 2);
-            const firstHalf = allLines.slice(0, mid).join('\n').trim();
-            const secondHalf = allLines.slice(mid).join('\n').trim();
-
-            // Prepare part 1 body. If there is a second half, add "continued" hint.
-            let body = "### 🤖 Gemini Code Review — Part 1/2\n\n";
-            body += firstHalf || "_(no content in first half)_";
-            if (secondHalf) body += "\n\n---\n*Continued in Part 2/2 — see next comment.*";
-
-            // Truncate if too big (safe guard)
+            // safe truncate
             const MAX = 60000;
-            if (body.length > MAX) {
-              body = body.slice(0, MAX - 60) + "\n\n(Truncated — see next comment for remainder.)";
-            }
+            if (body.length > MAX) body = body.slice(0, MAX - 120) + '\n\n(Truncated...)';
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -476,7 +479,101 @@ jobs:
               body
             });
 
-      - name: Post Gemini Review — Part 2/2
+      - name: Post Sonar summary — Part 2/3
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+
+            const base = (process.env.SONAR_HOST_URL || '').replace(/\/$/,'');
+            const token = process.env.SONAR_TOKEN || '';
+            const projectKey = process.env.SONAR_PROJECT_KEY || '';
+
+            let body = "### 🛰️ SonarQube Summary — Part 2/3\n\n";
+            if (!base || !token || !projectKey) {
+              body += "_Sonar environment variables missing — cannot query SonarQube._\n\n";
+              body += `SONAR_HOST_URL: ${!!process.env.SONAR_HOST_URL}\nSONAR_TOKEN: ${!!process.env.SONAR_TOKEN}\nSONAR_PROJECT_KEY: ${!!process.env.SONAR_PROJECT_KEY}\n`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+              return;
+            }
+
+            try {
+              // Query quality gate for the project key
+              const qgCmd = `curl -s -u "${token}:" "${base}/api/qualitygates/project_status?projectKey=${encodeURIComponent(projectKey)}"`;
+              const qgRaw = execSync(qgCmd, { encoding: 'utf8', stdio: ['pipe','pipe','ignore'] }).toString();
+              const qg = JSON.parse(qgRaw || '{}');
+
+              body += '**Quality Gate**\n\n';
+              if (qg && qg.projectStatus) {
+                body += `- status: **${qg.projectStatus.status || 'UNKNOWN'}**\n`;
+                if (Array.isArray(qg.projectStatus.conditions) && qg.projectStatus.conditions.length) {
+                  body += '- Conditions:\n';
+                  qg.projectStatus.conditions.forEach(c => {
+                    const actual = (c.actual && (c.actual.value !== undefined)) ? c.actual.value : 'null';
+                    body += `  - ${c.metricKey || 'unknown'} : ${c.status || 'UNKNOWN'} (actual: ${actual})\n`;
+                  });
+                }
+              } else {
+                body += '_Quality gate info not available._\n';
+              }
+
+              // Query key measures
+              const metrics = ['bugs','vulnerabilities','code_smells','coverage','duplicated_lines_density'];
+              const measuresCmd = `curl -s -u "${token}:" "${base}/api/measures/component?component=${encodeURIComponent(projectKey)}&metricKeys=${metrics.join(',')}"`;
+              const measuresRaw = execSync(measuresCmd, { encoding: 'utf8', stdio: ['pipe','pipe','ignore'] }).toString();
+              const measures = JSON.parse(measuresRaw || '{}');
+
+              body += '\n**Key measures**\n\n';
+              if (measures && measures.component && Array.isArray(measures.component.measures)) {
+                measures.component.measures.forEach(m => {
+                  body += `- ${m.metric}: ${m.value || 'null'}\n`;
+                });
+              } else {
+                body += '_Measures unavailable._\n';
+              }
+
+              // Optionally fetch top issues (up to 10)
+              try {
+                const issuesCmd = `curl -s -u "${token}:" "${base}/api/issues/search?componentKeys=${encodeURIComponent(projectKey)}&ps=10"`;
+                const issuesRaw = execSync(issuesCmd, { encoding: 'utf8', stdio: ['pipe','pipe','ignore'] }).toString();
+                const issues = JSON.parse(issuesRaw || '{}');
+                if (issues && Array.isArray(issues.issues) && issues.issues.length) {
+                  body += '\n**Top Sonar issues (up to 10)**\n\n';
+                  body += '| Severity | Rule | Location | Message |\n|---|---|---|---|\n';
+                  issues.issues.forEach(it => {
+                    const loc = (it.component || 'unknown') + (it.line ? `:${it.line}` : '');
+                    const msg = (it.message || '').replace(/\n/g,' ').slice(0,200);
+                    body += `| ${it.severity || 'INFO'} | ${it.rule || 'unknown'} | ${loc} | ${msg} |\n`;
+                  });
+                } else {
+                  body += '\n_No top Sonar issues found or none returned._\n';
+                }
+              } catch (e) {
+                body += '\n_Failed to fetch Sonar issues: ' + (e && e.toString ? e.toString() : String(e)) + '_\n';
+              }
+
+            } catch (err) {
+              body += '_Failed to query SonarQube:_\n```\n' + (err && err.toString ? err.toString() : String(err)) + '\n```\n';
+            }
+
+            // Truncate safely
+            if (body.length > 60000) body = body.slice(0, 59900) + '\n\n(Truncated...)';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Post Gemini Review — Part 3/3 (Encryption & Summary)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -487,50 +584,51 @@ jobs:
             // read raw gemini output
             let raw = "No Gemini review output generated.";
             try {
-              if (fs.existsSync('gemini_output.txt')) {
-                raw = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
-              } else {
-                raw = "Gemini output file not found (gemini_output.txt).";
-              }
+              if (fs.existsSync('gemini_output.txt')) raw = fs.readFileSync('gemini_output.txt', 'utf8') || raw;
             } catch (e) {
               raw = "Failed to read gemini_output.txt: " + e.toString();
             }
+            raw = raw.replace(/\r\n/g,'\n');
 
-            // Same cleanup as Part 1
-            let s = raw.replace(/\r\n/g, '\n');
-            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
-              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
+            // Helper to extract section by heading (### ... Encryption or "Encryption Review")
+            function extractHeadingSection(text, headingRegex) {
+              const idx = text.search(headingRegex);
+              if (idx === -1) return null;
+              const after = text.slice(idx);
+              const next = after.search(/\n###\s+/);
+              return next === -1 ? after : after.slice(0, next);
             }
-            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
-            s = s.replace(/<[^>]+\/>/g, '');
-            const lines = s.split('\n');
-            let minIndent = Infinity;
-            for (const l of lines) {
-              if (l.trim() === '') continue;
-              const m = l.match(/^(\s*)/);
-              if (m) minIndent = Math.min(minIndent, m[1].length);
-            }
-            if (minIndent === Infinity) minIndent = 0;
-            if (minIndent > 0 && minIndent <= 8) {
-              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
-            }
-            s = s.replace(/\n{3,}/g, '\n\n').trim();
 
-            // Split again into halves and pick second half
-            const allLines = s.split('\n');
-            const mid = Math.ceil(allLines.length / 2);
-            const secondHalf = allLines.slice(mid).join('\n').trim();
+            // Try to extract Encryption Review section
+            let enc = extractHeadingSection(raw, /###\s*5\.\s*Encryption Review|###\s*Encryption Review/i);
+            // Try alternative heading names
+            if (!enc) enc = extractHeadingSection(raw, /###\s*5\.\s*Encryption/i);
 
-            // If nothing in second half, post a short note instead
-            let body = "### 🤖 Gemini Code Review — Part 2/2\n\n";
-            body += secondHalf || "_(no additional content — all content posted in Part 1)_";
-
-            // Truncate if too big
-            const MAX = 60000;
-            if (body.length > MAX) {
-              body = body.slice(0, MAX - 60) + "\n\n(Truncated...)";
+            // Try to extract the <SUMMARY> block (if present)
+            let summary = null;
+            const sOpen = raw.indexOf('<SUMMARY>');
+            const sClose = raw.indexOf('</SUMMARY>');
+            if (sOpen !== -1 && sClose !== -1 && sClose > sOpen) {
+              summary = raw.slice(sOpen + '<SUMMARY>'.length, sClose).trim();
             }
+
+            // Compose final comment body
+            let body = '### 🔐 Encryption Review & Final Summary — Part 3/3\n\n';
+            if (enc) {
+              body += enc.trim() + '\n\n';
+            } else {
+              body += '_(Encryption Review section not found in Gemini output.)_\n\n';
+            }
+
+            if (summary) {
+              body += '---\n**Final Summary**\n\n' + summary + '\n';
+            } else {
+              // fallback: append last 120 lines of the raw output as "summary"
+              const tail = raw.split('\\n').slice(-120).join('\\n');
+              body += '---\n**Final Summary (fallback)**\n\n' + tail + '\n';
+            }
+
+            if (body.length > 60000) body = body.slice(0, 59900) + '\n\n(Truncated...)';
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
