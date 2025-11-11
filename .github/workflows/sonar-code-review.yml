@@ -401,7 +401,7 @@ jobs:
           echo "=== gemini_output.txt preview ==="
           sed -n '1,200p' gemini_output.txt || true
 
-      - name: Post Gemini Review as PR Comment
+      - name: Post Gemini Review — Part 1/2
         if: always()
         uses: actions/github-script@v7
         with:
@@ -409,86 +409,129 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // read file
-            let output = "No Gemini review output generated.";
+            // read raw gemini output
+            let raw = "No Gemini review output generated.";
             try {
               if (fs.existsSync('gemini_output.txt')) {
-                output = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!output || !output.trim()) output = "Gemini ran but produced empty output.";
+                raw = fs.readFileSync('gemini_output.txt', 'utf8');
+                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
               } else {
-                output = "Gemini output file not found (gemini_output.txt).";
+                raw = "Gemini output file not found (gemini_output.txt).";
               }
-            } catch (err) {
-              output = "Failed to read gemini_output.txt: " + err.toString();
+            } catch (e) {
+              raw = "Failed to read gemini_output.txt: " + e.toString();
             }
 
-            // Normalize newlines
-            output = output.replace(/\r\n/g, '\n');
+            // small sanitization/cleanup (keeps markdown tables/headings intact)
+            let s = raw.replace(/\r\n/g, '\n');
 
-            // 1) If entire content is wrapped in a single fenced code block, unwrap it
-            // but only when it starts and ends with fences and interior looks like markdown/text.
-            if (/^\s*```/.test(output) && /```\s*$/.test(output)) {
-              // remove only first and last fence pair
-              output = output.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
+            // If whole output is fenced, unwrap the outermost pair
+            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
+              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
             }
 
-            // 2) Unwrap/strip a few wrapper HTML-like tags that break GitHub markdown rendering.
-            //    e.g. <SUMMARY> ... </SUMMARY>, <summary> ... </summary>, <details> ... </details>
-            //    We'll remove the tags but keep the content inside.
-            const wrappers = ['summary', 'SUMMARY', 'details', 'DETAILS'];
-            for (const w of wrappers) {
-              const re = new RegExp(`<${w}[^>]*>([\\s\\S]*?)<\\/${w}>`, 'g');
-              output = output.replace(re, '$1');
+            // Remove wrapper-like tags (summary/details/etc) but keep inner content
+            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
+
+            // Remove any stray self-closing single tags (not critical content)
+            s = s.replace(/<[^>]+\/>/g, '');
+
+            // Detect small uniform indent and remove (so markdown renders)
+            const lines = s.split('\n');
+            let minIndent = Infinity;
+            for (const l of lines) {
+              if (l.trim() === '') continue;
+              const m = l.match(/^(\s*)/);
+              if (m) minIndent = Math.min(minIndent, m[1].length);
             }
-            // also remove any remaining empty top-level custom tags like <SUMMARY/> or <CUSTOM></CUSTOM>
-            output = output.replace(/<([A-Za-z][A-Za-z0-9_-]*)\s*\/>/g, '');
-            // remove accidental leading/trailing single tags that wrap entire doc
-            output = output.replace(/^\s*<[^>]+>\s*/g, '');
-            output = output.replace(/\s*<[^>]+>\s*$/g, '');
+            if (minIndent === Infinity) minIndent = 0;
+            if (minIndent > 0 && minIndent <= 8) {
+              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
+            }
 
-            // 3) Remove any control characters that might disturb rendering (keep normal whitespace)
-            output = output.replace(/[\u0000-\u0008\u000B-\u001F]/g, '');
+            // Collapse many blank lines
+            s = s.replace(/\n{3,}/g, '\n\n').trim();
 
-            // 4) Decode a few HTML entities commonly found
-            output = output.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+            // Split into two halves by line count
+            const allLines = s.split('\n');
+            const mid = Math.ceil(allLines.length / 2);
+            const firstHalf = allLines.slice(0, mid).join('\n').trim();
+            const secondHalf = allLines.slice(mid).join('\n').trim();
 
-            // 5) Ensure headings and tables render: make sure headers/tables are separated by blank lines
-            // Add a blank line before headings if not present
-            output = output.replace(/\n(#{1,6}\s)/g, '\n\n$1');
-            // Add a blank line before table lines starting with '|' if previous line not blank
-            output = output.replace(/([^\n])\n(\| ?[-A-Za-z0-9`| :,.!\"'()%#+\[\]]+\n\|[-\s\|:`\.]+)/g, '$1\n\n$2');
+            // Prepare part 1 body. If there is a second half, add "continued" hint.
+            let body = "### 🤖 Gemini Code Review — Part 1/2\n\n";
+            body += firstHalf || "_(no content in first half)_";
+            if (secondHalf) body += "\n\n---\n*Continued in Part 2/2 — see next comment.*";
 
-            // 6) Guarantee table header separators exist when a table header is detected but missing separator.
-            //    (If the table header line looks like "| A | B |" and the next line is "| C | D |" — add separator.)
-            output = output.replace(/(^\|[^\n]*\|\s*$\n)(?=\|[^\n]*\|\s*$)/gm, (m, header) => {
-              // build a separator line with --- for each column
-              const cols = header.trim().slice(1, -1).split('|');
-              const sep = '|' + cols.map(c => ' --- ').join('|') + '|\n';
-              return header + sep;
+            // Truncate if too big (safe guard)
+            const MAX = 60000;
+            if (body.length > MAX) {
+              body = body.slice(0, MAX - 60) + "\n\n(Truncated — see next comment for remainder.)";
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
             });
 
-            // 7) Collapse 3+ blank lines into 2
-            output = output.replace(/\n{3,}/g, '\n\n');
+      - name: Post Gemini Review — Part 2/2
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
 
-            // 8) Trim leading/trailing whitespace
-            output = output.trim();
-
-            // 9) Avoid huge comments; enforce safe limit
-            const MAX_CHARS = 60000;
-            if (output.length > MAX_CHARS) {
-              // keep head & tail to preserve context
-              const head = output.slice(0, 45000);
-              const tail = output.slice(-12000);
-              output = head + "\n\n(--- output truncated ---)\n\n" + tail;
+            // read raw gemini output
+            let raw = "No Gemini review output generated.";
+            try {
+              if (fs.existsSync('gemini_output.txt')) {
+                raw = fs.readFileSync('gemini_output.txt', 'utf8');
+                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
+              } else {
+                raw = "Gemini output file not found (gemini_output.txt).";
+              }
+            } catch (e) {
+              raw = "Failed to read gemini_output.txt: " + e.toString();
             }
 
-            // 10) Build nicely titled markdown body. Use a collapsible details block for long raw output,
-            //     but keep the top-level summary visible.
-            // If the content already contains "##" summary, use it; otherwise prepend a heading.
-            let header = "### 🤖 Gemini Code Review Result\n\n";
-            let body = header + output;
+            // Same cleanup as Part 1
+            let s = raw.replace(/\r\n/g, '\n');
+            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
+              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
+            }
+            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
+            s = s.replace(/<[^>]+\/>/g, '');
+            const lines = s.split('\n');
+            let minIndent = Infinity;
+            for (const l of lines) {
+              if (l.trim() === '') continue;
+              const m = l.match(/^(\s*)/);
+              if (m) minIndent = Math.min(minIndent, m[1].length);
+            }
+            if (minIndent === Infinity) minIndent = 0;
+            if (minIndent > 0 && minIndent <= 8) {
+              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
+            }
+            s = s.replace(/\n{3,}/g, '\n\n').trim();
 
-            // Post as single comment
+            // Split again into halves and pick second half
+            const allLines = s.split('\n');
+            const mid = Math.ceil(allLines.length / 2);
+            const secondHalf = allLines.slice(mid).join('\n').trim();
+
+            // If nothing in second half, post a short note instead
+            let body = "### 🤖 Gemini Code Review — Part 2/2\n\n";
+            body += secondHalf || "_(no additional content — all content posted in Part 1)_";
+
+            // Truncate if too big
+            const MAX = 60000;
+            if (body.length > MAX) {
+              body = body.slice(0, MAX - 60) + "\n\n(Truncated...)";
+            }
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
