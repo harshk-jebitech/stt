@@ -157,7 +157,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           BASE="${BASE%/}"
           echo "Fetching Sonar data for project=${SONAR_PROJECT_KEY}, PR=${PR_NUMBER}"
 
@@ -173,10 +173,22 @@ jobs:
             "${BASE}/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
             -o sonar_data/measures.json || echo "{}" > sonar_data/measures.json
 
-          # Fetch top issues (limit 10)
+          # 1) Try PR-scoped issues first (most relevant for PR reviews)
           curl -s -u "${SONAR_TOKEN}:" \
-            "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&pullRequest=${PR_NUMBER}&ps=10" \
-            -o sonar_data/issues.json || echo "{}" > sonar_data/issues.json
+            "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&pullRequest=${PR_NUMBER}&ps=20" \
+            -o sonar_data/issues_pr.json || echo "{}" > sonar_data/issues_pr.json
+
+          # 2) If PR-scoped returned none, fallback to component-wide issues (wider scan)
+          HAS_PR_ISSUES=$(jq -r '(.issues | length) // 0' sonar_data/issues_pr.json 2>/dev/null || echo "0")
+          if [ "${HAS_PR_ISSUES}" -eq 0 ]; then
+            echo "No PR-scoped issues found; fetching component-wide issues as fallback..."
+            curl -s -u "${SONAR_TOKEN}:" \
+              "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&ps=50" \
+              -o sonar_data/issues_component.json || echo "{}" > sonar_data/issues_component.json
+            ISSUES_FILE="sonar_data/issues_component.json"
+          else
+            ISSUES_FILE="sonar_data/issues_pr.json"
+          fi
 
           echo "## 🛰️ SonarQube Summary for PR #${PR_NUMBER}" > sonar_comment.md
           echo "" >> sonar_comment.md
@@ -205,14 +217,25 @@ jobs:
           echo "" >> sonar_comment.md
 
           # --- TOP ISSUES ---
-          echo "### ⚠️ Top Sonar Issues (up to 10)" >> sonar_comment.md
-          if jq -e '.issues' sonar_data/issues.json >/dev/null 2>&1; then
-            echo "" >> sonar_comment.md
-            echo "| Severity | Rule | Location | Message |" >> sonar_comment.md
-            echo "|---|---|---|---|" >> sonar_comment.md
-            jq -r '.issues | sort_by(.severity) | reverse | .[0:10] | .[] | "| " + (.severity // "INFO") + " | " + (.rule // "unknown") + " | " + ((.component // "unknown") + (if .line then ":" + (.line|tostring) else "" end)) + " | " + (.message|gsub("\n"; " ")) + " |"' sonar_data/issues.json >> sonar_comment.md
+          echo "### ⚠️ Top Sonar Issues" >> sonar_comment.md
+
+          if jq -e '.issues' "${ISSUES_FILE}" >/dev/null 2>&1; then
+            COUNT=$(jq -r '(.issues | length) // 0' "${ISSUES_FILE}")
+            if [ "$COUNT" -eq 0 ]; then
+              echo "_No Sonar issues returned for this query._" >> sonar_comment.md
+            else
+              echo "" >> sonar_comment.md
+              echo "| Severity | Rule | Location | Message |" >> sonar_comment.md
+              echo "|---|---|---|---|" >> sonar_comment.md
+              # Sort by severity (string sort) then show first 20 results - truncate messages to 300 chars
+              jq -r '.issues | sort_by(.severity) | reverse | .[0:20] | .[] |
+                ("| " + (.severity // "INFO") +
+                 " | " + (.rule // "unknown") +
+                 " | " + ((.component // "unknown") + (if .line then ":" + (.line|tostring) else "" end)) +
+                 " | " + ((.message // "") | gsub("\n"; " ") | .[0:300]) + " |")' "${ISSUES_FILE}" >> sonar_comment.md
+            fi
           else
-            echo "- (no issues found or failed to parse)" >> sonar_comment.md
+            echo "_Failed to parse issues JSON or none returned._" >> sonar_comment.md
           fi
           echo "" >> sonar_comment.md
 
@@ -223,7 +246,7 @@ jobs:
           fi
 
           echo "=== sonar_comment.md preview ==="
-          head -n 50 sonar_comment.md || true
+          sed -n '1,200p' sonar_comment.md || true
 
           # --- POST COMMENT TO GITHUB ---
           PAYLOAD=$(jq -Rs --arg body "$(cat sonar_comment.md)" '{body: $body}')
