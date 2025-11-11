@@ -32,12 +32,6 @@ jobs:
           pip install -r requirements.txt || true
           pip install pytest pytest-cov || true
 
-      - name: Create smoke-import tests (auto)
-        run: |
-          cat > tests/tests_dummy.py <<'PY'
-          PY
-          echo "Created tests/tests_dummy.py"
-
       - name: Run tests & produce coverage XML
         env:
           PYTHONPATH: .
