@@ -48,14 +48,6 @@ jobs:
         env:
           SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName=stt
-            -Dsonar.sources=.
-            -Dsonar.python.version=3.10
-            -Dsonar.verbose=true
-            -Dsonar.python.coverage.reportPaths=coverage.xml
 
       - name: Copy scanner output for later steps (safe)
         run: |
@@ -75,37 +67,6 @@ jobs:
           fi
           echo "Listing $TARGET:"
           ls -la "$TARGET" || true
-
-      - name: Sonar debug -- show report-task.txt & query server issues
-        env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
-        run: |
-          set -e
-          echo "Workspace files (top-level):"
-          ls -la || true
-
-          # locate the report-task.txt in several likely places
-          REPORT_PATH=$(find . -maxdepth 4 -type f -name 'report-task.txt' -print -quit || true)
-          # prefer the copied scanner folder if present
-          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork_copy ]; then
-            REPORT_PATH=$(find .scannerwork_copy -type f -name 'report-task.txt' -print -quit || true)
-          fi
-
-          if [ -n "$REPORT_PATH" ]; then
-            echo "---- $REPORT_PATH ----"
-            cat "$REPORT_PATH" || true
-            echo "--------------------------------------"
-          else
-            echo "report-task.txt not found in workspace (searched up to depth 4)."
-          fi
-          echo "Querying Sonar for recent issues (first 50)..."
-          BASE="${SONAR_HOST_URL%/}"
-          curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&ps=50" \
-            | jq '.paging, .issues | {count: (. | length), issues: .[0:10]}' || true
-          echo "Querying quality gate (project_status)..."
-          curl -s -u "${SONAR_TOKEN}:" "${BASE}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" | jq . || true
 
       - name: Ensure jq is available (for polling JSON)
         run: |
