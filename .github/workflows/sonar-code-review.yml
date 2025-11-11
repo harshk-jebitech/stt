@@ -88,20 +88,12 @@ jobs:
           CE_URL=""
 
           if [ -f report-task.txt ]; then
-            REPORT_FILE="report-task.txt"
-          elif [ -f .scannerwork/report-task.txt ]; then
-            REPORT_FILE=".scannerwork/report-task.txt"
+            echo "report-task.txt found. Contents:"
+            cat report-task.txt
+            CE_URL=$(grep '^ceTaskUrl=' report-task.txt | cut -d'=' -f2- || true)
+            ANALYSIS_ID=$(grep '^analysisId=' report-task.txt | cut -d'=' -f2- || true)
           else
-            REPORT_FILE=$(find . -type f -path "*/.scannerwork/report-task.txt" | head -n1 || true)
-          fi
-
-          if [ -n "${REPORT_FILE}" ] && [ -f "${REPORT_FILE}" ]; then
-            echo "✅ Found report-task.txt at: ${REPORT_FILE}"
-            cat "${REPORT_FILE}"
-            CE_URL=$(grep '^ceTaskUrl=' "${REPORT_FILE}" | cut -d'=' -f2- || true)
-            ANALYSIS_ID=$(grep '^analysisId=' "${REPORT_FILE}" | cut -d'=' -f2- || true)
-          else
-            echo "⚠️  report-task.txt NOT found in workspace or .scannerwork directory. Will fall back to polling by projectKey."
+            echo "report-task.txt NOT found in workspace. Will fall back to polling by projectKey."
           fi
 
           # Helper to call Sonar with token
