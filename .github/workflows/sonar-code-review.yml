@@ -37,8 +37,8 @@ jobs:
           cat > tests/tests_dummy.py <<'PY'
           PY
           echo "Created tests/tests_dummy.py"
-          
-      - name: Run smoke tests & produce coverage XML
+
+      - name: Run tests & produce coverage XML
         env:
           PYTHONPATH: .
         run: |
@@ -46,12 +46,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-cov || true
           mkdir -p coverage-reports
-          # Run pytest, produce Cobertura-style XML for Sonar
+          # generate coverage.xml in coverage-reports/
           pytest -q --disable-warnings --maxfail=1 --cov=. --cov-report=xml:coverage-reports/coverage-python.xml || true
           echo "coverage files:"
           ls -la coverage-reports || true
           echo "coverage xml preview:"
-          sed -n '1,120p' coverage-reports/coverage-python.xml || true
+          sed -n '1,160p' coverage-reports/coverage-python.xml || true
 
       - name: Validate Sonar secrets (fail early)
         run: |
