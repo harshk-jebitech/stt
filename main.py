@@ -84,7 +84,6 @@ async def transcribe(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/transcribe_and_extract")
 async def transcribe_and_extract(file: UploadFile = File(...)):
     content_type = file.content_type or "audio/wav"
@@ -112,5 +111,3 @@ async def transcribe_and_extract(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
