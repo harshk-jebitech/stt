@@ -33,16 +33,19 @@ jobs:
           pip install pytest pytest-cov || true
 
       - name: Run tests & produce coverage XML
-        # Always run tests so Sonar gets coverage; keep exit non-zero if tests fail (adjust if desired)
-        run: |
-          set -euo pipefail
-          mkdir -p coverage-reports
-          # Run pytest with coverage and emit Cobertura-style XML (pytest-cov produces coverage xml)
-          pytest --maxfail=1 --disable-warnings -q --cov=. --cov-report=xml:coverage-reports/coverage-python.xml
-          echo "coverage files:"
-          ls -la coverage-reports || true
         env:
           PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov || true
+          mkdir -p coverage-reports
+          # generate coverage.xml in coverage-reports/
+          pytest -q --disable-warnings --maxfail=1 --cov=. --cov-report=xml:coverage-reports/coverage-python.xml || true
+          echo "coverage files:"
+          ls -la coverage-reports || true
+          echo "coverage xml preview:"
+          sed -n '1,160p' coverage-reports/coverage-python.xml || true
 
       - name: Validate Sonar secrets (fail early)
         run: |
@@ -405,62 +408,87 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            // Load raw output (fallback message kept)
+
+            // read file
             let output = "No Gemini review output generated.";
             try {
               if (fs.existsSync('gemini_output.txt')) {
                 output = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!output || !output.trim()) {
-                  output = "Gemini ran but produced empty output.";
-                }
+                if (!output || !output.trim()) output = "Gemini ran but produced empty output.";
+              } else {
+                output = "Gemini output file not found (gemini_output.txt).";
               }
             } catch (err) {
               output = "Failed to read gemini_output.txt: " + err.toString();
             }
 
-            // --- Sanitization / "beautify" logic ---
-
             // Normalize newlines
             output = output.replace(/\r\n/g, '\n');
 
-            // If the entire output is a single fenced code block (```...```), unwrap it.
-            // This commonly causes headings to be shown literally.
+            // 1) If entire content is wrapped in a single fenced code block, unwrap it
+            // but only when it starts and ends with fences and interior looks like markdown/text.
             if (/^\s*```/.test(output) && /```\s*$/.test(output)) {
-              // remove only the outermost pair of fences
-              output = output.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/,'').trim();
+              // remove only first and last fence pair
+              output = output.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
             }
 
-            // Detect a uniform leading indentation across *non-empty* lines (e.g. every line starts with 4 spaces).
-            // If found and it's small (<=8), remove that indent so markdown renders instead of a code block.
-            const lines = output.split('\n');
-            let minIndent = Infinity;
-            for (const l of lines) {
-              if (l.trim() === '') continue;
-              const m = l.match(/^(\s*)/);
-              if (m) {
-                minIndent = Math.min(minIndent, m[1].length);
-              }
+            // 2) Unwrap/strip a few wrapper HTML-like tags that break GitHub markdown rendering.
+            //    e.g. <SUMMARY> ... </SUMMARY>, <summary> ... </summary>, <details> ... </details>
+            //    We'll remove the tags but keep the content inside.
+            const wrappers = ['summary', 'SUMMARY', 'details', 'DETAILS'];
+            for (const w of wrappers) {
+              const re = new RegExp(`<${w}[^>]*>([\\s\\S]*?)<\\/${w}>`, 'g');
+              output = output.replace(re, '$1');
             }
-            if (minIndent === Infinity) minIndent = 0;
-            if (minIndent > 0 && minIndent <= 8) {
-              // Remove exactly minIndent chars from each line if present
-              output = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
-            }
+            // also remove any remaining empty top-level custom tags like <SUMMARY/> or <CUSTOM></CUSTOM>
+            output = output.replace(/<([A-Za-z][A-Za-z0-9_-]*)\s*\/>/g, '');
+            // remove accidental leading/trailing single tags that wrap entire doc
+            output = output.replace(/^\s*<[^>]+>\s*/g, '');
+            output = output.replace(/\s*<[^>]+>\s*$/g, '');
 
-            // Decode a few HTML entities that may appear escaped
+            // 3) Remove any control characters that might disturb rendering (keep normal whitespace)
+            output = output.replace(/[\u0000-\u0008\u000B-\u001F]/g, '');
+
+            // 4) Decode a few HTML entities commonly found
             output = output.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
-            // Trim trailing/leading whitespace and collapse multiple blank lines to max two
-            output = output.trim().replace(/\n{3,}/g, '\n\n');
+            // 5) Ensure headings and tables render: make sure headers/tables are separated by blank lines
+            // Add a blank line before headings if not present
+            output = output.replace(/\n(#{1,6}\s)/g, '\n\n$1');
+            // Add a blank line before table lines starting with '|' if previous line not blank
+            output = output.replace(/([^\n])\n(\| ?[-A-Za-z0-9`| :,.!\"'()%#+\[\]]+\n\|[-\s\|:`\.]+)/g, '$1\n\n$2');
 
-            // Avoid accidentally posting huge comments; keep within a safe size but preserve meaningful content
+            // 6) Guarantee table header separators exist when a table header is detected but missing separator.
+            //    (If the table header line looks like "| A | B |" and the next line is "| C | D |" — add separator.)
+            output = output.replace(/(^\|[^\n]*\|\s*$\n)(?=\|[^\n]*\|\s*$)/gm, (m, header) => {
+              // build a separator line with --- for each column
+              const cols = header.trim().slice(1, -1).split('|');
+              const sep = '|' + cols.map(c => ' --- ').join('|') + '|\n';
+              return header + sep;
+            });
+
+            // 7) Collapse 3+ blank lines into 2
+            output = output.replace(/\n{3,}/g, '\n\n');
+
+            // 8) Trim leading/trailing whitespace
+            output = output.trim();
+
+            // 9) Avoid huge comments; enforce safe limit
             const MAX_CHARS = 60000;
             if (output.length > MAX_CHARS) {
-              output = output.slice(0, MAX_CHARS) + "\n\n(Truncated large output...)";
+              // keep head & tail to preserve context
+              const head = output.slice(0, 45000);
+              const tail = output.slice(-12000);
+              output = head + "\n\n(--- output truncated ---)\n\n" + tail;
             }
-            // Build the comment body (Markdown)
-            const body = `### 🤖 Gemini Code Review Result\n\n${output}`;
-            // Post comment
+
+            // 10) Build nicely titled markdown body. Use a collapsible details block for long raw output,
+            //     but keep the top-level summary visible.
+            // If the content already contains "##" summary, use it; otherwise prepend a heading.
+            let header = "### 🤖 Gemini Code Review Result\n\n";
+            let body = header + output;
+
+            // Post as single comment
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
