@@ -157,71 +157,102 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           BASE="${BASE%/}"
           echo "Fetching Sonar data for project=${SONAR_PROJECT_KEY}, PR=${PR_NUMBER}"
 
-          # Issues for this PR (up to 500)
-          curl -s -u "${SONAR_TOKEN}:" \
-            "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&pullRequest=${PR_NUMBER}&ps=500" \
-            -o sonar_issues.json || echo "{}" > sonar_issues.json
+          mkdir -p sonar_data
 
-          # Quality gate status (project)
+          # Fetch project quality gate
           curl -s -u "${SONAR_TOKEN}:" \
             "${BASE}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
-            -o sonar_qg.json || echo "{}" > sonar_qg.json
+            -o sonar_data/qg.json || echo "{}" > sonar_data/qg.json
 
-          # Key measures
+          # Fetch key measures
           curl -s -u "${SONAR_TOKEN}:" \
             "${BASE}/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
-            -o sonar_measures.json || echo "{}" > sonar_measures.json
+            -o sonar_data/measures.json || echo "{}" > sonar_data/measures.json
 
-          # Build a compact Markdown comment
-          echo "## 🔎 SonarQube Analysis Summary for PR #${PR_NUMBER}" > sonar_comment.md
-          echo "" >> sonar_comment.md
+          # 1) Try PR-scoped issues first (most relevant for PR reviews)
+          curl -s -u "${SONAR_TOKEN}:" \
+            "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&pullRequest=${PR_NUMBER}&ps=20" \
+            -o sonar_data/issues_pr.json || echo "{}" > sonar_data/issues_pr.json
 
-          # Quality Gate
-          if jq -e '.projectStatus' sonar_qg.json >/dev/null 2>&1; then
-            jq -r '.projectStatus | "Quality Gate status: **" + (.status // "UNKNOWN") + "**\n\n"' sonar_qg.json >> sonar_comment.md
+          # 2) If PR-scoped returned none, fallback to component-wide issues (wider scan)
+          HAS_PR_ISSUES=$(jq -r '(.issues | length) // 0' sonar_data/issues_pr.json 2>/dev/null || echo "0")
+          if [ "${HAS_PR_ISSUES}" -eq 0 ]; then
+            echo "No PR-scoped issues found; fetching component-wide issues as fallback..."
+            curl -s -u "${SONAR_TOKEN}:" \
+              "${BASE}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&ps=50" \
+              -o sonar_data/issues_component.json || echo "{}" > sonar_data/issues_component.json
+            ISSUES_FILE="sonar_data/issues_component.json"
           else
-            echo "Quality Gate status: (unavailable)\n\n" >> sonar_comment.md
+            ISSUES_FILE="sonar_data/issues_pr.json"
           fi
 
-          # Key metrics
-          echo "### Key metrics" >> sonar_comment.md
-          if jq -e '.component.measures' sonar_measures.json >/dev/null 2>&1; then
-            jq -r '.component.measures[] | "- " + .metric + ": " + (.value // "null")' sonar_measures.json >> sonar_comment.md
+          echo "## 🛰️ SonarQube Summary for PR #${PR_NUMBER}" > sonar_comment.md
+          echo "" >> sonar_comment.md
+
+          # --- QUALITY GATE ---
+          echo "### 🧭 Quality Gate" >> sonar_comment.md
+          if jq -e '.projectStatus' sonar_data/qg.json >/dev/null 2>&1; then
+            jq -r '.projectStatus | "- **Status:** " + (.status // "UNKNOWN")' sonar_data/qg.json >> sonar_comment.md
+            if jq -e '.projectStatus.conditions' sonar_data/qg.json >/dev/null 2>&1; then
+              echo "" >> sonar_comment.md
+              echo "- **Conditions:**" >> sonar_comment.md
+              jq -r '.projectStatus.conditions[] | "  - " + (.metricKey // "unknown") + ": " + (.status // "UNKNOWN") + " (actual: " + ((.actual.value // "null")|tostring) + ")"' sonar_data/qg.json >> sonar_comment.md
+            fi
+          else
+            echo "- (Quality gate unavailable)" >> sonar_comment.md
+          fi
+          echo "" >> sonar_comment.md
+
+          # --- KEY METRICS ---
+          echo "### 📊 Key Metrics" >> sonar_comment.md
+          if jq -e '.component.measures' sonar_data/measures.json >/dev/null 2>&1; then
+            jq -r '.component.measures[] | "- " + .metric + ": " + (.value // "null")' sonar_data/measures.json >> sonar_comment.md
           else
             echo "- (metrics unavailable)" >> sonar_comment.md
           fi
           echo "" >> sonar_comment.md
 
-          # Top issues (nice table): severity, rule, file:line, message (up to 20)
-          echo "### Top Sonar issues (limited to 20)" >> sonar_comment.md
-          if jq -e '.issues' sonar_issues.json >/dev/null 2>&1; then
-            echo "" >> sonar_comment.md
-            echo "| Severity | Rule | Location | Message |" >> sonar_comment.md
-            echo "|---|---|---|---|" >> sonar_comment.md
-            jq -r '.issues | sort_by(.severity) | reverse | .[0:20] | .[] | "| " + (.severity // "INFO") + " | " + (.rule // "unknown") + " | " + ((.component // "unknown") + (if .line then ":" + (.line|tostring) else "" end)) + " | " + (.message|gsub("\n"; " ")) + " |"' sonar_issues.json >> sonar_comment.md
+          # --- TOP ISSUES ---
+          echo "### ⚠️ Top Sonar Issues" >> sonar_comment.md
+
+          if jq -e '.issues' "${ISSUES_FILE}" >/dev/null 2>&1; then
+            COUNT=$(jq -r '(.issues | length) // 0' "${ISSUES_FILE}")
+            if [ "$COUNT" -eq 0 ]; then
+              echo "_No Sonar issues returned for this query._" >> sonar_comment.md
+            else
+              echo "" >> sonar_comment.md
+              echo "| Severity | Rule | Location | Message |" >> sonar_comment.md
+              echo "|---|---|---|---|" >> sonar_comment.md
+              # Sort by severity (string sort) then show first 20 results - truncate messages to 300 chars
+              jq -r '.issues | sort_by(.severity) | reverse | .[0:20] | .[] |
+                ("| " + (.severity // "INFO") +
+                 " | " + (.rule // "unknown") +
+                 " | " + ((.component // "unknown") + (if .line then ":" + (.line|tostring) else "" end)) +
+                 " | " + ((.message // "") | gsub("\n"; " ") | .[0:300]) + " |")' "${ISSUES_FILE}" >> sonar_comment.md
+            fi
           else
-            echo "- (no issues found or failed to parse)" >> sonar_comment.md
+            echo "_Failed to parse issues JSON or none returned._" >> sonar_comment.md
           fi
           echo "" >> sonar_comment.md
 
-          # Provide link to Sonar UI
+          # --- SONAR DASHBOARD LINK ---
           if grep -q '^dashboardUrl=' .scannerwork*/report-task.txt 2>/dev/null; then
             DASH=$(grep '^dashboardUrl=' .scannerwork*/report-task.txt 2>/dev/null | cut -d'=' -f2- | head -n1)
-            echo "View full results in SonarQube: ${DASH}" >> sonar_comment.md
+            echo "[🔗 View full results in SonarQube Dashboard](${DASH})" >> sonar_comment.md
           fi
 
           echo "=== sonar_comment.md preview ==="
           sed -n '1,200p' sonar_comment.md || true
 
-          # Post the comment using GH CLI (curl to GitHub API)
+          # --- POST COMMENT TO GITHUB ---
           PAYLOAD=$(jq -Rs --arg body "$(cat sonar_comment.md)" '{body: $body}')
           API="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments"
           curl -s -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d "$PAYLOAD" "$API" \
-            && echo "Posted Sonar summary comment."
+            && echo "✅ Posted Sonar summary comment to PR #${PR_NUMBER}."
 
   gemini-review:
     name: Gemini AI Code Review
@@ -464,7 +495,7 @@ jobs:
             if (secondHalf) body += "\n\n---\n*Continued in Part 2/2 — see next comment.*";
 
             // Truncate if too big (safe guard)
-            const MAX = 60000;
+            const MAX = 64000;
             if (body.length > MAX) {
               body = body.slice(0, MAX - 60) + "\n\n(Truncated — see next comment for remainder.)";
             }
@@ -527,7 +558,7 @@ jobs:
             body += secondHalf || "_(no additional content — all content posted in Part 1)_";
 
             // Truncate if too big
-            const MAX = 60000;
+            const MAX = 64000;
             if (body.length > MAX) {
               body = body.slice(0, MAX - 60) + "\n\n(Truncated...)";
             }
