@@ -447,15 +447,15 @@ jobs:
               ? context.issue.number
               : (github && github.context && github.context.payload && github.context.payload.pull_request && github.context.payload.pull_request.number)
                 ? github.context.payload.pull_request.number
-                : process.env.PR_NUMBER || null;
+                : (process.env.PR_NUMBER ? parseInt(process.env.PR_NUMBER, 10) : null);
 
             if (!issueNumber) {
-              console.log("No issue/PR number found in context — skipping comment posting.");
+              console.log("No PR/issue context found — skipping comment posting.");
               return;
             }
 
             // -------------------------
-            // Helper: find gemini_output.txt (robust like your shell logic)
+            // Find gemini output file (mirrors your shell logic)
             // -------------------------
             function findGeminiFile() {
               const candidates = [
@@ -470,17 +470,17 @@ jobs:
                   if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
                 } catch (e) {}
               }
-
+              // shallow search top-level + one-level deep for stdout.log
               try {
                 const entries = fs.readdirSync('.');
                 for (const e of entries) {
-                  if (e.toLowerCase().includes('stdout.log') && fs.existsSync(e) && fs.statSync(e).isFile()) return e;
-                  const maybeDir = `./${e}`;
-                  if (fs.existsSync(maybeDir) && fs.statSync(maybeDir).isDirectory()) {
-                    const sub = fs.readdirSync(maybeDir);
+                  const maybe = `./${e}`;
+                  if (fs.existsSync(maybe) && fs.statSync(maybe).isFile() && e.toLowerCase().includes('stdout.log')) return maybe;
+                  if (fs.existsSync(maybe) && fs.statSync(maybe).isDirectory()) {
+                    const sub = fs.readdirSync(maybe);
                     for (const s of sub) {
                       if (s.toLowerCase().includes('stdout.log')) {
-                        const candidate = `${maybeDir}/${s}`;
+                        const candidate = `${maybe}/${s}`;
                         if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
                       }
                     }
@@ -491,18 +491,16 @@ jobs:
             }
 
             // -------------------------
-            // Load raw gemini output
+            // Read raw gemini output (with fallbacks)
             // -------------------------
-            let raw = null;
+            let raw;
             const found = findGeminiFile();
             if (!found) {
               raw = "Gemini action produced no output file. Check run_gemini logs.";
             } else {
               try {
                 raw = fs.readFileSync(found, 'utf8');
-                if (!raw || !raw.trim()) {
-                  raw = "Gemini ran but produced empty output.";
-                }
+                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
               } catch (e) {
                 raw = `Failed to read ${found}: ${e.toString()}`;
               }
@@ -510,6 +508,12 @@ jobs:
 
             // -------------------------
             // Sanitization / cleanup
+            // - normalize newlines
+            // - unwrap outer fenced block if present
+            // - remove <summary>/<details> wrappers (keep inner content)
+            // - remove stray self-closing tags
+            // - remove small uniform indent
+            // - collapse extra blank lines
             // -------------------------
             let s = String(raw).replace(/\r\n/g, '\n');
 
@@ -536,6 +540,7 @@ jobs:
 
             // -------------------------
             // Split into sections by headings
+            // (keeps fenced code blocks intact)
             // -------------------------
             function splitSections(text) {
               const lines = text.split('\n');
@@ -546,29 +551,56 @@ jobs:
               const summaryStartRe = /^\s*<\s*SUMMARY\s*>\s*$/i;
               const summaryEndRe = /^\s*<\s*\/\s*SUMMARY\s*>\s*$/i;
 
-              let inSummaryBlock = false;
-              const summaryBuffer = [];
+              let inSummary = false;
+              const summaryBuf = [];
+
+              // track fenced codeblock state
+              let inFence = false;
+              let fenceMarker = null;
 
               for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
+                const rawLine = lines[i];
 
-                if (summaryStartRe.test(line)) {
-                  inSummaryBlock = true;
+                // fence detection (``` or ~~~)
+                const fenceMatch = rawLine.match(/^(\s*)(```|~~~)/);
+                if (fenceMatch) {
+                  const marker = fenceMatch[2];
+                  if (!inFence) {
+                    inFence = true;
+                    fenceMarker = marker;
+                  } else if (marker === fenceMarker) {
+                    inFence = false;
+                    fenceMarker = null;
+                  }
+                  // include fence lines
+                  if (inSummary) summaryBuf.push(rawLine); else current.content.push(rawLine);
                   continue;
                 }
-                if (summaryEndRe.test(line)) {
-                  inSummaryBlock = false;
-                  const content = summaryBuffer.join('\n').trim();
+
+                // handle <SUMMARY> blocks
+                if (summaryStartRe.test(rawLine) && !inFence) {
+                  inSummary = true;
+                  continue;
+                }
+                if (summaryEndRe.test(rawLine) && inSummary && !inFence) {
+                  inSummary = false;
+                  const content = summaryBuf.join('\n').trim();
                   if (content) sections.push({ title: 'Review Summary', content });
-                  summaryBuffer.length = 0;
+                  summaryBuf.length = 0;
                   continue;
                 }
-                if (inSummaryBlock) {
-                  summaryBuffer.push(line);
+                if (inSummary) {
+                  summaryBuf.push(rawLine);
                   continue;
                 }
 
-                const h = line.match(headingRe);
+                if (inFence) {
+                  current.content.push(rawLine);
+                  continue;
+                }
+
+                // detect heading lines (only outside of fenced blocks)
+                const h = rawLine.match(headingRe);
                 if (h) {
                   const title = h[1].trim();
                   if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
@@ -578,9 +610,10 @@ jobs:
                   continue;
                 }
 
-                current.content.push(line);
+                current.content.push(rawLine);
               }
 
+              // push last
               if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
                 sections.push({ title: current.title || 'Misc', content: current.content.join('\n').trim() });
               }
@@ -594,34 +627,80 @@ jobs:
             }
 
             // -------------------------
-            // Build comments
+            // Build comments where each comment contains up to 2 sections
             // -------------------------
-            const MAX = 64000;
-            const commentsToPost = [];
+            const GH_MAX = 64000;
+            const groupedComments = [];
 
-            for (let i = 0; i < sections.length; i++) {
-              const sec = sections[i];
-              let title = sec.title ? String(sec.title) : `Section ${i+1}`;
-              title = title.replace(/^\d+\.*\s*/, '').trim();
+            for (let i = 0; i < sections.length; i += 2) {
+              const s1 = sections[i];
+              const s2 = (i + 1 < sections.length) ? sections[i + 1] : null;
 
-              let content = sec.content ? String(sec.content).trim() : '';
-              if (!content) content = "_(no content for this heading)_";
+              const title1 = s1.title ? String(s1.title).replace(/^\d+\.*\s*/, '').trim() : `Section ${i+1}`;
+              const content1 = s1.content && String(s1.content).trim() ? s1.content.trim() : "_(no content for this heading)_";
 
-              let body = `### 🤖 Gemini Code Review — ${title}\n\n${content}`;
-              if (body.length > MAX) {
-                body = body.slice(0, MAX - 120) + `\n\n(Truncated — full content available in gemini_output.txt or logs.)`;
+              let body1 = `### 🤖 Gemini Code Review — ${title1}\n\n${content1}`;
+
+              let body;
+              if (s2) {
+                const title2 = s2.title ? String(s2.title).replace(/^\d+\.*\s*/, '').trim() : `Section ${i+2}`;
+                const content2 = s2.content && String(s2.content).trim() ? s2.content.trim() : "_(no content for this heading)_";
+                const body2 = `### 🤖 Gemini Code Review — ${title2}\n\n${content2}`;
+                body = body1 + '\n\n' + body2;
+              } else {
+                body = body1;
               }
-              commentsToPost.push(body);
+
+              // If the combined body is too large, prefer truncating the second section content first (if present),
+              // otherwise truncate the first section. Truncation tries to cut at a blank line or safe character boundary.
+              if (body.length > GH_MAX) {
+                const headroom = 300; // leave some room for footer/truncation note
+                if (s2) {
+                  // try to trim s2 content to fit
+                  const allowed = GH_MAX - headroom - body1.length;
+                  if (allowed > 200) {
+                    // keep at least 200 chars of second section
+                    const title2 = s2.title ? String(s2.title).replace(/^\d+\.*\s*/, '').trim() : `Section ${i+2}`;
+                    let content2 = s2.content ? String(s2.content).trim() : "";
+                    if (content2.length > allowed) {
+                      // try to cut at last blank-line before allowed limit
+                      let cut = content2.slice(0, allowed);
+                      const lastDouble = cut.lastIndexOf('\n\n');
+                      if (lastDouble > Math.floor(allowed * 0.2)) cut = cut.slice(0, lastDouble);
+                      content2 = cut.trim() + '\n\n(Truncated — remainder in gemini_output.txt)';
+                    }
+                    body = body1 + '\n\n' + `### 🤖 Gemini Code Review — ${title2}\n\n` + content2;
+                  } else {
+                    // not enough room to include second section - drop second entirely with a note
+                    body = body1 + '\n\n_(Second section omitted due to size — see gemini_output.txt for full content)_';
+                  }
+                } else {
+                  // only one big section: truncate it
+                  const allowed = GH_MAX - headroom;
+                  let content = body1;
+                  if (content.length > allowed) {
+                    let cut = content.slice(0, allowed);
+                    const lastDouble = cut.lastIndexOf('\n\n');
+                    if (lastDouble > Math.floor(allowed * 0.2)) cut = cut.slice(0, lastDouble);
+                    content = cut.trim() + '\n\n(Truncated — remainder in gemini_output.txt)';
+                  }
+                  body = content;
+                }
+              }
+
+              groupedComments.push({
+                headings: s2 ? [title1, (s2.title ? String(s2.title).replace(/^\d+\.*\s*/, '').trim() : `Section ${i+2}`)] : [title1],
+                body
+              });
             }
 
             // -------------------------
-            // Post comments
+            // Post grouped comments sequentially
             // -------------------------
-            for (let idx = 0; idx < commentsToPost.length; idx++) {
-              const body = commentsToPost[idx];
-              const footer = `\n\n---\n*Comment ${idx+1} of ${commentsToPost.length} — generated from gemini_output.txt*`;
-              const finalBody = body + footer;
-
+            for (let idx = 0; idx < groupedComments.length; idx++) {
+              const item = groupedComments[idx];
+              const footer = `\n\n---\n*Comment ${idx+1} of ${groupedComments.length} — includes: ${item.headings.map(h => '`' + h + '`').join(', ')}*`;
+              const finalBody = item.body + footer;
               try {
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
@@ -630,8 +709,9 @@ jobs:
                   body: finalBody
                 });
               } catch (err) {
-                const titleForErr = (commentsToPost[idx] && commentsToPost[idx].split('\n')[0]) ? commentsToPost[idx].split('\n')[0] : `#${idx+1}`;
-                const errBody = `### ⚠️ Gemini Review — Posting Failed\n\nFailed to post comment ${idx+1} (${titleForErr}):\n\`\`\`\n${(err && err.toString) ? err.toString() : String(err)}\n\`\`\`\n\nPartial results may have been posted.`;
+                // Post an error comment and rethrow so workflow logs show the failure
+                const errMsg = (err && err.toString) ? err.toString() : String(err);
+                const errBody = `### ⚠️ Gemini Review — Posting Failed\n\nFailed to post grouped comment ${idx+1} including headings: ${item.headings.join(', ')}\n\`\`\`\n${errMsg}\n\`\`\`\n\nPartial results may have been posted.`;
                 try {
                   await github.rest.issues.createComment({
                     owner: context.repo.owner,
@@ -640,10 +720,10 @@ jobs:
                     body: errBody
                   });
                 } catch (postErr) {
-                  console.error("Additionally failed to post error comment:", postErr);
+                  console.error("Also failed to post error comment:", postErr);
                 }
                 throw err;
               }
             }
 
-            console.log(`Posted ${commentsToPost.length} comment(s) to issue/PR #${issueNumber}.`);
+            console.log(`Posted ${groupedComments.length} comment(s) to PR/issue #${issueNumber}.`);
