@@ -437,124 +437,213 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          const fs = require('fs');
+          script: |
+            const fs = require('fs');
 
-          // -------------------------
-          // Determine issue/PR number robustly
-          // -------------------------
-          const issueNumber = (context && context.issue && context.issue.number)
-            ? context.issue.number
-            : (github && github.context && github.context.payload && github.context.payload.pull_request && github.context.payload.pull_request.number)
-              ? github.context.payload.pull_request.number
-              : process.env.PR_NUMBER || null;
+            // -------------------------
+            // Determine issue/PR number robustly
+            // -------------------------
+            const issueNumber = (context && context.issue && context.issue.number)
+              ? context.issue.number
+              : (github && github.context && github.context.payload && github.context.payload.pull_request && github.context.payload.pull_request.number)
+                ? github.context.payload.pull_request.number
+                : process.env.PR_NUMBER || null;
 
-          if (!issueNumber) {
-            // Nothing to post to (not a PR/issue context). Exit gracefully.
-            console.log("No issue/PR number found in context — skipping comment posting.");
-            return;
-          }
-
-          // -------------------------
-          // Helper: find gemini_output.txt (robust like your shell logic)
-          // -------------------------
-          function findGeminiFile() {
-            const candidates = [
-              'gemini_output.txt',
-              'gemini-output.txt',
-              'gemini-artifacts/stdout.log',
-              'stdout.log',
-              'gemini-artifacts/stdout.txt'
-            ];
-            for (const c of candidates) {
-              try {
-                if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
-              } catch (e) {}
+            if (!issueNumber) {
+              console.log("No issue/PR number found in context — skipping comment posting.");
+              return;
             }
 
-            // fallback: shallow search for any stdout.log files (top-level & one-level deep)
-            try {
-              const entries = fs.readdirSync('.');
-              for (const e of entries) {
-                if (e.toLowerCase().includes('stdout.log') && fs.existsSync(e) && fs.statSync(e).isFile()) return e;
-                const maybeDir = `./${e}`;
-                if (fs.existsSync(maybeDir) && fs.statSync(maybeDir).isDirectory()) {
-                  const sub = fs.readdirSync(maybeDir);
-                  for (const s of sub) {
-                    if (s.toLowerCase().includes('stdout.log')) {
-                      const candidate = `${maybeDir}/${s}`;
-                      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+            // -------------------------
+            // Helper: find gemini_output.txt (robust like your shell logic)
+            // -------------------------
+            function findGeminiFile() {
+              const candidates = [
+                'gemini_output.txt',
+                'gemini-output.txt',
+                'gemini-artifacts/stdout.log',
+                'stdout.log',
+                'gemini-artifacts/stdout.txt'
+              ];
+              for (const c of candidates) {
+                try {
+                  if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+                } catch (e) {}
+              }
+
+              try {
+                const entries = fs.readdirSync('.');
+                for (const e of entries) {
+                  if (e.toLowerCase().includes('stdout.log') && fs.existsSync(e) && fs.statSync(e).isFile()) return e;
+                  const maybeDir = `./${e}`;
+                  if (fs.existsSync(maybeDir) && fs.statSync(maybeDir).isDirectory()) {
+                    const sub = fs.readdirSync(maybeDir);
+                    for (const s of sub) {
+                      if (s.toLowerCase().includes('stdout.log')) {
+                        const candidate = `${maybeDir}/${s}`;
+                        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+                      }
                     }
                   }
                 }
-              }
-            } catch (e) {
-              // ignore
+              } catch (e) {}
+              return null;
             }
-            return null;
-          }
 
-          // -------------------------
-          // Load raw gemini output
-          // -------------------------
-          let raw = null;
-          const found = findGeminiFile();
-          if (!found) {
-            raw = "Gemini action produced no output file. Check run_gemini logs.";
-          } else {
-            try {
-              raw = fs.readFileSync(found, 'utf8');
-              if (!raw || !raw.trim()) {
-                raw = "Gemini ran but produced empty output.";
+            // -------------------------
+            // Load raw gemini output
+            // -------------------------
+            let raw = null;
+            const found = findGeminiFile();
+            if (!found) {
+              raw = "Gemini action produced no output file. Check run_gemini logs.";
+            } else {
+              try {
+                raw = fs.readFileSync(found, 'utf8');
+                if (!raw || !raw.trim()) {
+                  raw = "Gemini ran but produced empty output.";
+                }
+              } catch (e) {
+                raw = `Failed to read ${found}: ${e.toString()}`;
               }
-            } catch (e) {
-              raw = `Failed to read ${found}: ${e.toString()}`;
             }
-          }
 
-          // -------------------------
-          // Sanitization / cleanup
-          // -------------------------
-          let s = String(raw).replace(/\r\n/g, '\n');
+            // -------------------------
+            // Sanitization / cleanup
+            // -------------------------
+            let s = String(raw).replace(/\r\n/g, '\n');
 
-          // unwrap outer fenced block (``` ... ```)
-          if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
-            s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
-          }
+            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
+              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
+            }
 
-          // remove summary/details wrappers but keep inner content
-          s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
+            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
+            s = s.replace(/<[^>]+\/>/g, '');
 
-          // remove simple self-closing tags
-          s = s.replace(/<[^>]+\/>/g, '');
+            const linesForIndent = s.split('\n');
+            let minIndent = Infinity;
+            for (const l of linesForIndent) {
+              if (l.trim() === '') continue;
+              const m = l.match(/^(\s*)/);
+              if (m) minIndent = Math.min(minIndent, m[1].length);
+            }
+            if (minIndent === Infinity) minIndent = 0;
+            if (minIndent > 0 && minIndent <= 8) {
+              s = linesForIndent.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
+            }
 
-          // remove small uniform indent
-          const linesForIndent = s.split('\n');
-          let minIndent = Infinity;
-          for (const l of linesForIndent) {
-            if (l.trim() === '') continue;
-            const m = l.match(/^(\s*)/);
-            if (m) minIndent = Math.min(minIndent, m[1].length);
-          }
-          if (minIndent === Infinity) minIndent = 0;
-          if (minIndent > 0 && minIndent <= 8) {
-            s = linesForIndent.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
-          }
+            s = s.replace(/\n{3,}/g, '\n\n').trim();
 
-          // collapse many blank lines
-          s = s.replace(/\n{3,}/g, '\n\n').trim();
+            // -------------------------
+            // Split into sections by headings
+            // -------------------------
+            function splitSections(text) {
+              const lines = text.split('\n');
+              const sections = [];
+              let current = { title: null, content: [] };
 
-          // -------------------------
-          // Split into sections by top-level headings:
-          // Accepts headings like: ### 1. Scope, ### Scope, ## Review Findings Summary, etc.
-          // Also supports explicit <SUMMARY> ... </SUMMARY> blocks.
-          // -------------------------
-          function splitSections(text) {
-            const lines = text.split('\n');
-            const sections = [];
-            let current = { title: null, content: [] };
+              const headingRe = /^\s*#{2,3}\s*(?:\d+\.)?\s*(.+?)\s*$/;
+              const summaryStartRe = /^\s*<\s*SUMMARY\s*>\s*$/i;
+              const summaryEndRe = /^\s*<\s*\/\s*SUMMARY\s*>\s*$/i;
 
-            // headings: lines starting with ## or ### (optionally numbered)
-            const headingRe = /^\s*#{2,3}\s*(?:\d+\.)?\s*(.+?)\s*$/;
-            const summaryStartRe = /^\s*<\s*SUMMARY\s*>\s*$/i;
-            const summ
+              let inSummaryBlock = false;
+              const summaryBuffer = [];
+
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+
+                if (summaryStartRe.test(line)) {
+                  inSummaryBlock = true;
+                  continue;
+                }
+                if (summaryEndRe.test(line)) {
+                  inSummaryBlock = false;
+                  const content = summaryBuffer.join('\n').trim();
+                  if (content) sections.push({ title: 'Review Summary', content });
+                  summaryBuffer.length = 0;
+                  continue;
+                }
+                if (inSummaryBlock) {
+                  summaryBuffer.push(line);
+                  continue;
+                }
+
+                const h = line.match(headingRe);
+                if (h) {
+                  const title = h[1].trim();
+                  if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
+                    sections.push({ title: current.title || 'Intro', content: current.content.join('\n').trim() });
+                  }
+                  current = { title: title, content: [] };
+                  continue;
+                }
+
+                current.content.push(line);
+              }
+
+              if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
+                sections.push({ title: current.title || 'Misc', content: current.content.join('\n').trim() });
+              }
+
+              return sections;
+            }
+
+            let sections = splitSections(s);
+            if (!sections || sections.length === 0) {
+              sections = [{ title: 'Gemini Output', content: s || '(empty)' }];
+            }
+
+            // -------------------------
+            // Build comments
+            // -------------------------
+            const MAX = 64000;
+            const commentsToPost = [];
+
+            for (let i = 0; i < sections.length; i++) {
+              const sec = sections[i];
+              let title = sec.title ? String(sec.title) : `Section ${i+1}`;
+              title = title.replace(/^\d+\.*\s*/, '').trim();
+
+              let content = sec.content ? String(sec.content).trim() : '';
+              if (!content) content = "_(no content for this heading)_";
+
+              let body = `### 🤖 Gemini Code Review — ${title}\n\n${content}`;
+              if (body.length > MAX) {
+                body = body.slice(0, MAX - 120) + `\n\n(Truncated — full content available in gemini_output.txt or logs.)`;
+              }
+              commentsToPost.push(body);
+            }
+
+            // -------------------------
+            // Post comments
+            // -------------------------
+            for (let idx = 0; idx < commentsToPost.length; idx++) {
+              const body = commentsToPost[idx];
+              const footer = `\n\n---\n*Comment ${idx+1} of ${commentsToPost.length} — generated from gemini_output.txt*`;
+              const finalBody = body + footer;
+
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: parseInt(issueNumber, 10),
+                  body: finalBody
+                });
+              } catch (err) {
+                const titleForErr = (commentsToPost[idx] && commentsToPost[idx].split('\n')[0]) ? commentsToPost[idx].split('\n')[0] : `#${idx+1}`;
+                const errBody = `### ⚠️ Gemini Review — Posting Failed\n\nFailed to post comment ${idx+1} (${titleForErr}):\n\`\`\`\n${(err && err.toString) ? err.toString() : String(err)}\n\`\`\`\n\nPartial results may have been posted.`;
+                try {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: parseInt(issueNumber, 10),
+                    body: errBody
+                  });
+                } catch (postErr) {
+                  console.error("Additionally failed to post error comment:", postErr);
+                }
+                throw err;
+              }
+            }
+
+            console.log(`Posted ${commentsToPost.length} comment(s) to issue/PR #${issueNumber}.`);
