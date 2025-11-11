@@ -432,7 +432,7 @@ jobs:
           echo "=== gemini_output.txt preview ==="
           sed -n '1,200p' gemini_output.txt || true
 
-      - name: Post Gemini Review — Part 1/2
+      - name: Post Gemini Review Comments (one comment per heading/table)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -440,132 +440,322 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // read raw gemini output
-            let raw = "No Gemini review output generated.";
-            try {
-              if (fs.existsSync('gemini_output.txt')) {
-                raw = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
-              } else {
-                raw = "Gemini output file not found (gemini_output.txt).";
-              }
-            } catch (e) {
-              raw = "Failed to read gemini_output.txt: " + e.toString();
+            // ----------------------------
+            // Robustly determine PR/issue number
+            // ----------------------------
+            const issueNumber = (context && context.issue && context.issue.number)
+              ? context.issue.number
+              : (github && github.context && github.context.payload && github.context.payload.pull_request && github.context.payload.pull_request.number)
+                ? github.context.payload.pull_request.number
+                : (process.env.PR_NUMBER ? parseInt(process.env.PR_NUMBER, 10) : null);
+
+            if (!issueNumber) {
+              console.log("No PR/issue context found — skipping Gemini comment posting.");
+              return;
             }
 
-            // small sanitization/cleanup (keeps markdown tables/headings intact)
-            let s = raw.replace(/\r\n/g, '\n');
+            // ----------------------------
+            // Find gemini output file (mirrors your shell logic)
+            // ----------------------------
+            function findGeminiFile() {
+              const candidates = [
+                'gemini_output.txt',
+                'gemini-output.txt',
+                'gemini-artifacts/stdout.log',
+                'stdout.log',
+                'gemini-artifacts/stdout.txt'
+              ];
+              for (const c of candidates) {
+                try {
+                  if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+                } catch (e) {}
+              }
+              // shallow search (top-level + one-level) for files named stdout.log
+              try {
+                const entries = fs.readdirSync('.');
+                for (const e of entries) {
+                  const maybe = `./${e}`;
+                  if (fs.existsSync(maybe) && fs.statSync(maybe).isFile() && e.toLowerCase().includes('stdout.log')) return maybe;
+                  if (fs.existsSync(maybe) && fs.statSync(maybe).isDirectory()) {
+                    const sub = fs.readdirSync(maybe);
+                    for (const s of sub) {
+                      if (s.toLowerCase().includes('stdout.log')) {
+                        const candidate = `${maybe}/${s}`;
+                        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                // ignore
+              }
+              return null;
+            }
 
-            // If whole output is fenced, unwrap the outermost pair
+            // ----------------------------
+            // Read raw gemini output with fallbacks
+            // ----------------------------
+            let raw;
+            const found = findGeminiFile();
+            if (!found) {
+              raw = "Gemini action produced no output file. Check run_gemini logs.";
+            } else {
+              try {
+                raw = fs.readFileSync(found, 'utf8');
+                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
+              } catch (e) {
+                raw = `Failed to read ${found}: ${e.toString()}`;
+              }
+            }
+
+            // ----------------------------
+            // Basic sanitization while preserving markdown tables and headings
+            // - normalize newlines
+            // - unwrap outer fenced block if present
+            // - remove <summary>/<details> wrappers (keep inner content)
+            // - remove stray self-closing tags
+            // - remove small uniform indent
+            // - collapse excessive blank lines
+            // ----------------------------
+            let s = String(raw).replace(/\r\n/g, '\n');
+
+            // unwrap outer fence if entire output is fenced
             if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
               s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
             }
 
-            // Remove wrapper-like tags (summary/details/etc) but keep inner content
+            // remove wrapper-like tags but keep content
             s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
 
-            // Remove any stray self-closing single tags (not critical content)
+            // remove self-closing tags (non-essential)
             s = s.replace(/<[^>]+\/>/g, '');
 
-            // Detect small uniform indent and remove (so markdown renders)
-            const lines = s.split('\n');
+            // detect small uniform indent and remove it (helps keep markdown aligned)
+            const linesInitial = s.split('\n');
             let minIndent = Infinity;
-            for (const l of lines) {
+            for (const l of linesInitial) {
               if (l.trim() === '') continue;
               const m = l.match(/^(\s*)/);
               if (m) minIndent = Math.min(minIndent, m[1].length);
             }
             if (minIndent === Infinity) minIndent = 0;
             if (minIndent > 0 && minIndent <= 8) {
-              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
+              s = linesInitial.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
             }
 
-            // Collapse many blank lines
             s = s.replace(/\n{3,}/g, '\n\n').trim();
 
-            // Split into two halves by line count
-            const allLines = s.split('\n');
-            const mid = Math.ceil(allLines.length / 2);
-            const firstHalf = allLines.slice(0, mid).join('\n').trim();
-            const secondHalf = allLines.slice(mid).join('\n').trim();
+            // ----------------------------
+            // Parser: split into sections by headings (## / ###)
+            // Requirements:
+            // - heading line like "### 1. Scope" or "## Review Findings Summary" starts a section
+            // - section includes everything up to the next heading
+            // - do NOT split inside fenced code blocks (```), or inside tables — we collect until table end
+            // - support explicit <SUMMARY> ... </SUMMARY> as its own section
+            // ----------------------------
+            function splitIntoHeadingSections(text) {
+              const lines = text.split('\n');
+              const sections = [];
+              let current = { title: null, content: [] };
 
-            // Prepare part 1 body. If there is a second half, add "continued" hint.
-            let body = "### 🤖 Gemini Code Review — Part 1/2\n\n";
-            body += firstHalf || "_(no content in first half)_";
-            if (secondHalf) body += "\n\n---\n*Continued in Part 2/2 — see next comment.*";
+              const headingRe = /^\s*#{2,3}\s*(?:\d+\.)?\s*(.+?)\s*$/; // capture heading text after ##/###
+              const summaryStartRe = /^\s*<\s*SUMMARY\s*>\s*$/i;
+              const summaryEndRe = /^\s*<\s*\/\s*SUMMARY\s*>\s*$/i;
 
-            // Truncate if too big (safe guard)
-            const MAX = 64000;
-            if (body.length > MAX) {
-              body = body.slice(0, MAX - 60) + "\n\n(Truncated — see next comment for remainder.)";
-            }
+              let inSummaryBlock = false;
+              const summaryBuf = [];
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
+              // track fenced codeblock state — don't treat heading-like lines inside a fenced block as headings
+              let inFence = false;
+              let fenceMarker = null; // ``` or ~~~
 
-      - name: Post Gemini Review — Part 2/2
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
+              for (let i = 0; i < lines.length; i++) {
+                const rawLine = lines[i];
 
-            // read raw gemini output
-            let raw = "No Gemini review output generated.";
-            try {
-              if (fs.existsSync('gemini_output.txt')) {
-                raw = fs.readFileSync('gemini_output.txt', 'utf8');
-                if (!raw || !raw.trim()) raw = "Gemini ran but produced empty output.";
-              } else {
-                raw = "Gemini output file not found (gemini_output.txt).";
+                // fence detection (``` or ~~~), support optional language on opening fence
+                const fenceMatch = rawLine.match(/^(\s*)(```|~~~)/);
+                if (fenceMatch) {
+                  const marker = fenceMatch[2];
+                  if (!inFence) {
+                    inFence = true;
+                    fenceMarker = marker;
+                  } else if (marker === fenceMarker) {
+                    inFence = false;
+                    fenceMarker = null;
+                  }
+                  // always include fence lines in current content
+                  if (inSummaryBlock) summaryBuf.push(rawLine); else current.content.push(rawLine);
+                  continue;
+                }
+
+                // handle explicit <SUMMARY> blocks (these are not fenced code)
+                if (summaryStartRe.test(rawLine) && !inFence) {
+                  inSummaryBlock = true;
+                  continue;
+                }
+                if (summaryEndRe.test(rawLine) && inSummaryBlock && !inFence) {
+                  inSummaryBlock = false;
+                  const content = summaryBuf.join('\n').trim();
+                  if (content) sections.push({ title: 'Review Summary', content });
+                  summaryBuf.length = 0;
+                  continue;
+                }
+                if (inSummaryBlock) {
+                  summaryBuf.push(rawLine);
+                  continue;
+                }
+
+                // If inside fenced code, do not attempt to detect headings — just collect
+                if (inFence) {
+                  current.content.push(rawLine);
+                  continue;
+                }
+
+                // Heading detection (only when NOT in fence or summary block)
+                const h = rawLine.match(headingRe);
+                if (h) {
+                  const title = h[1].trim();
+                  // push previous section (if any)
+                  if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
+                    sections.push({ title: current.title || 'Intro', content: current.content.join('\n').trim() });
+                  }
+                  // start new section with this heading as the title (we won't include the heading line in content)
+                  current = { title: title, content: [] };
+                  continue; // skip adding the heading itself into content
+                }
+
+                // Not a heading line: add to current content
+                current.content.push(rawLine);
               }
-            } catch (e) {
-              raw = "Failed to read gemini_output.txt: " + e.toString();
+
+              // push last
+              if ((current.title && current.title.trim() !== '') || (current.content && current.content.join('\n').trim() !== '')) {
+                sections.push({ title: current.title || 'Misc', content: current.content.join('\n').trim() });
+              }
+
+              return sections;
             }
 
-            // Same cleanup as Part 1
-            let s = raw.replace(/\r\n/g, '\n');
-            if (/^\s*```/.test(s) && /```\s*$/.test(s)) {
-              s = s.replace(/^\s*```(?:\w+)?\n?/, '').replace(/\n?```\s*$/, '').trim();
-            }
-            s = s.replace(/<\s*(summary|SUMMARY|details|DETAILS)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>/g, '$2');
-            s = s.replace(/<[^>]+\/>/g, '');
-            const lines = s.split('\n');
-            let minIndent = Infinity;
-            for (const l of lines) {
-              if (l.trim() === '') continue;
-              const m = l.match(/^(\s*)/);
-              if (m) minIndent = Math.min(minIndent, m[1].length);
-            }
-            if (minIndent === Infinity) minIndent = 0;
-            if (minIndent > 0 && minIndent <= 8) {
-              s = lines.map(l => l.startsWith(' '.repeat(minIndent)) ? l.slice(minIndent) : l).join('\n');
-            }
-            s = s.replace(/\n{3,}/g, '\n\n').trim();
+            const sections = splitIntoHeadingSections(s).filter(sec => sec && (sec.title || (sec.content && sec.content.trim() !== '')));
 
-            // Split again into halves and pick second half
-            const allLines = s.split('\n');
-            const mid = Math.ceil(allLines.length / 2);
-            const secondHalf = allLines.slice(mid).join('\n').trim();
+            // If nothing parsed, fallback to one giant section
+            const finalSections = (sections && sections.length > 0) ? sections : [{ title: 'Gemini Output', content: s || '(empty)' }];
 
-            // If nothing in second half, post a short note instead
-            let body = "### 🤖 Gemini Code Review — Part 2/2\n\n";
-            body += secondHalf || "_(no additional content — all content posted in Part 1)_";
+            // ----------------------------
+            // Helper to ensure we don't split a markdown table across comments:
+            // If a section ends in the middle of a table (i.e., last non-empty lines are table rows starting with '|'),
+            // we will attempt to extend the section until the table ends (lines that look like table rows or alignment rows).
+            // (This is defensive — our split logic already takes whole section until next heading; this ensures mid-section tables
+            //  that may be followed by a heading line accidentally recognized inside table aren't cut.)
+            // ----------------------------
+            function extendSectionToCompleteTable(sectionContent, followingLines) {
+              // If last non-empty line of section is not a table row, nothing to do.
+              const lines = sectionContent.split('\n');
+              let ptr = lines.length - 1;
+              while (ptr >= 0 && lines[ptr].trim() === '') ptr--;
+              if (ptr < 0) return { content: sectionContent, consumed: 0 };
 
-            // Truncate if too big
-            const MAX = 64000;
-            if (body.length > MAX) {
-              body = body.slice(0, MAX - 60) + "\n\n(Truncated...)";
+              const lastLine = lines[ptr] || '';
+              // table row detection: starts with '|' OR contains '| ---' separator line
+              const isTableRow = /^\s*\|/.test(lastLine) || /^\s*:?-{2,}\s*\|/.test(lastLine);
+              if (!isTableRow) return { content: sectionContent, consumed: 0 };
+
+              // We are at table end? If the next lines (from followingLines) continue table rows, pull them in.
+              let consumed = 0;
+              const added = [];
+              for (let i = 0; i < followingLines.length; i++) {
+                const ln = followingLines[i];
+                // If blank line occurs after table and then a heading, stop. We treat lines that start with '|' as table row
+                if (/^\s*\|/.test(ln) || /^\s*$/.test(ln) || /^\s*\|?-{2,}/.test(ln)) {
+                  // include it as part of table block (blank lines allowed)
+                  added.push(ln);
+                  consumed++;
+                } else {
+                  // non-table content: stop extending
+                  break;
+                }
+              }
+              if (consumed > 0) {
+                const newContent = sectionContent + '\n' + added.join('\n');
+                return { content: newContent.trim(), consumed };
+              }
+              return { content: sectionContent, consumed: 0 };
             }
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
+            // ----------------------------
+            // Build comment bodies (one per section)
+            // - ensure the comment ends at logical boundaries (table end or paragraph end)
+            // - truncate large sections safely, preferring to cut after a blank line or table boundary
+            // ----------------------------
+            const GH_MAX = 64000;
+            const comments = [];
+
+            for (let i = 0; i < finalSections.length; i++) {
+              const sec = finalSections[i];
+              let title = sec.title ? String(sec.title).replace(/^\d+\.*\s*/, '').trim() : `Section ${i+1}`;
+              let content = sec.content ? String(sec.content).trim() : '';
+
+              // If the section is empty, add a placeholder table/row (so each heading still has a comment)
+              if (!content) {
+                content = "_(no content for this heading)_\n\n| (none) | | | |";
+              }
+
+              // Build initial body
+              let body = `### 🤖 Gemini Code Review — ${title}\n\n${content}`;
+
+              // If body is too large, try to find a safe split point: prefer last double-newline, last table end, or truncate
+              if (body.length > GH_MAX) {
+                // prefer to split at last blank-line + small neighborhood
+                const candidates = [];
+
+                // 1) last double newline within limit
+                const snippet = body.slice(0, GH_MAX - 200); // leave headroom
+                const lastDouble = snippet.lastIndexOf('\n\n');
+                if (lastDouble > Math.floor(snippet.length * 0.2)) candidates.push(lastDouble);
+
+                // 2) last table boundary (closing row) within snippet (find last line starting with '|')
+                const lastPipe = snippet.lastIndexOf('\n|');
+                if (lastPipe > 0) candidates.push(lastPipe);
+
+                // choose best (largest safe)
+                const chosen = (candidates.length > 0) ? Math.max(...candidates) : GH_MAX - 300;
+                body = body.slice(0, chosen) + `\n\n(Truncated — remainder available in gemini_output.txt or logs.)`;
+              }
+
+              comments.push(body);
+            }
+
+            // ----------------------------
+            // Post comments sequentially
+            // ----------------------------
+            for (let idx = 0; idx < comments.length; idx++) {
+              const c = comments[idx];
+              const footer = `\n\n---\n*Comment ${idx+1} of ${comments.length} — generated from gemini_output.txt*`;
+              const finalBody = c + footer;
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: parseInt(issueNumber, 10),
+                  body: finalBody
+                });
+                // note: no artificial sleeps here; GitHub REST allows multiple comments in sequence.
+              } catch (err) {
+                // safe error reporting as a comment
+                const errMsg = (err && err.toString) ? err.toString() : String(err);
+                const errBody = `### ⚠️ Gemini Review — Posting Failed\n\nFailed to post comment ${idx+1} (${idx+1}/${comments.length}):\n\`\`\`\n${errMsg}\n\`\`\`\n\nPartial results may have been posted.`;
+                try {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: parseInt(issueNumber, 10),
+                    body: errBody
+                  });
+                } catch (postErr) {
+                  console.error("Also failed to post error comment:", postErr);
+                }
+                throw err;
+              }
+            }
+
+            console.log(`Posted ${comments.length} Gemini comment(s) to PR/issue #${issueNumber}.`);
