@@ -75,7 +75,7 @@ jobs:
             sudo apt-get install -y jq
           fi
 
-      - name: Wait for Sonar analysis & check Quality Gate (robust)
+      - name: Wait for Sonar analysis & check Quality Gate
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -84,31 +84,27 @@ jobs:
           set -euo pipefail
           echo "🔎 Locating report-task.txt (written by the scanner)..."
 
-          # Try several common locations for report-task.txt
-          REPORT_PATH=""
-          REPORT_PATH=$(find . -maxdepth 4 -type f -name 'report-task.txt' -print -quit || true)
-          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork_copy ]; then
-            REPORT_PATH=$(find .scannerwork_copy -type f -name 'report-task.txt' -print -quit || true)
-          fi
-          if [ -z "$REPORT_PATH" ] && [ -d .scannerwork ]; then
-            REPORT_PATH=$(find .scannerwork -type f -name 'report-task.txt' -print -quit || true)
-          fi
-
-          if [ -z "$REPORT_PATH" ]; then
-            echo "⚠️ report-task.txt not found in workspace. Will fall back to polling by projectKey."
-          else
-            echo "✅ Found report-task.txt: $REPORT_PATH"
-            cat "$REPORT_PATH" || true
-          fi
-
           ANALYSIS_ID=""
           CE_URL=""
 
-          if [ -n "$REPORT_PATH" ]; then
-            CE_URL=$(grep '^ceTaskUrl=' "$REPORT_PATH" | cut -d'=' -f2- || true)
-            ANALYSIS_ID=$(grep '^analysisId=' "$REPORT_PATH" | cut -d'=' -f2- || true)
+          if [ -f report-task.txt ]; then
+            REPORT_FILE="report-task.txt"
+          elif [ -f .scannerwork/report-task.txt ]; then
+            REPORT_FILE=".scannerwork/report-task.txt"
+          else
+            REPORT_FILE=$(find . -type f -path "*/.scannerwork/report-task.txt" | head -n1 || true)
           fi
 
+          if [ -n "${REPORT_FILE}" ] && [ -f "${REPORT_FILE}" ]; then
+            echo "✅ Found report-task.txt at: ${REPORT_FILE}"
+            cat "${REPORT_FILE}"
+            CE_URL=$(grep '^ceTaskUrl=' "${REPORT_FILE}" | cut -d'=' -f2- || true)
+            ANALYSIS_ID=$(grep '^analysisId=' "${REPORT_FILE}" | cut -d'=' -f2- || true)
+          else
+            echo "⚠️  report-task.txt NOT found in workspace or .scannerwork directory. Will fall back to polling by projectKey."
+          fi
+
+          # Helper to call Sonar with token
           sonar_api() {
             local path="$1"
             curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL%/}${path}"
@@ -129,7 +125,7 @@ jobs:
               fi
               if [ "${status}" = "FAILED" ]; then
                 echo "❌ CE task failed:"
-                echo "$TASK_JSON" | jq . || true
+                echo "$TASK_JSON" | jq .
                 exit 1
               fi
               sleep 5
@@ -151,11 +147,10 @@ jobs:
             done
           fi
 
-          # If we still don't have analysisId, print latest project status and fail (or optionally continue)
           if [ -z "${ANALYSIS_ID}" ]; then
-            echo "⚠️  Could not determine analysisId. Fetching current project quality gate status as last resort..."
+            echo "⚠️  Could not determine analysisId. As a last resort, fetching current project quality gate status..."
             QG_JSON=$(sonar_api "/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}")
-            echo "$QG_JSON" | jq . || true
+            echo "$QG_JSON" | jq .
             status=$(echo "$QG_JSON" | jq -r '.projectStatus.status // "UNKNOWN"')
             echo "Quality Gate status (fallback): $status"
             if [ "$status" = "OK" ]; then
@@ -163,8 +158,6 @@ jobs:
               exit 0
             else
               echo "❌ Quality Gate indicates failure or unknown (fallback). Failing job."
-              # show failed conditions if present
-              echo "$QG_JSON" | jq -r '.projectStatus.conditions[] | " - " + (.metricKey // "unknown") + ": " + (.status // "UNKNOWN") + " (actual: " + (.actual.value|tostring) + ")"' || true
               exit 1
             fi
           fi
